@@ -25,16 +25,20 @@ class AgentConfig:
 
 # ===== Tool 基类 =====
 class Tool:
-    def __init__(self, name, func, description, schema):
+    def __init__(self, name, description, schema):
         self.name = name
-        self.func = func
         self.description = description
         self.schema = schema
 
-    def run(self, **kwargs):
-        return self.func(**kwargs)
+    def exec(self, **kwargs):
+        raise NotImplementedError("子类需要实现 exec 方法")
 
 
+class Add(Tool):
+    def __init__(self, name, description, schema):
+        super().__init__(name, description, schema)
+    def exec(self, **kwargs):
+        return super().exec(**kwargs)
 
 
 
