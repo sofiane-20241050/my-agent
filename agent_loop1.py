@@ -3,13 +3,32 @@ import re
 from dotenv import load_dotenv
 import json
 import inspect
+import requests
+from tavily import TavilyClient
 import asyncio
 from typing import *
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from openai import OpenAI
-from prompt import SYSTEM_PROMPT
 import logging
+from datetime import datetime
+from prompt import SYSTEM_PROMPT
 
+
+# 创建日志目录
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+
+# 配置 logger
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(
+            f"{log_dir}/agent_loop_{datetime.now():%Y%m%d_%H%M%S}.log",
+            encoding='utf-8'
+        )
+    ]
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +36,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ModelConfig:
     provider: str = "zai"        # openai / anthropic / openai
-    model: str = "GLM-4-Flash"
+    model: str = "GLM-4.5-Air"
 
     api_key: Optional[str] = None
     base_url: Optional[str] = None
@@ -50,7 +69,7 @@ class Tool:
                 "parameters": self.parameters,
             },
         }
-    def exec(self, **kwargs):
+    async def exec(self, **kwargs):
         raise NotImplementedError("子类需要实现 exec 方法")
     
 
@@ -64,8 +83,8 @@ class ToolRegistry:
     def get(self, name: str):
         return self.tools.get(name)
 
-    def list(self):
-        return self.tools.values()
+    def _list(self):
+        return list(self.tools.values())
 
 
 class Add(Tool):
@@ -82,16 +101,93 @@ class Add(Tool):
                 "type": "integer",
                 "description": "被加数"
             }
-    },
+        },
         "required": ["a", "b"],
     }
 
-    def exec(self, a: str, b: str):
+    async def exec(self, a: str, b: str):
         # 将字符串转换为数字
         a = float(a)  # 可以用 int(a) 或 float(a) 取决于你的需求
         b = float(b)
         result = a + b
         return str(result)
+
+
+class Weather(Tool):
+    name = "get_weather"
+    description = "获取指定城市的当前天气信息"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "city": {
+                "type": "string",
+                "description": "城市名称"
+            }
+        },
+        "required": ["city"],
+    }
+
+    async def exec(self, city: str):
+        url = f"https://wttr.in/{city}?format=j1"
+        try:
+            response = requests.get(url, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+
+            current = data["current_condition"][0]
+            desc = current["weatherDesc"][0]["value"]
+            temp = current["temp_C"]
+
+            return f"{city}当前天气：{desc}，气温{temp}°C"
+
+        except Exception as e:
+            return f"天气查询失败：{str(e)}"
+
+
+class TavilySearch(Tool):
+    name = "tavily_search"
+    description = "使用Tavily搜索引擎获取互联网信息摘要"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "搜索关键词或问题"
+            }
+        },
+        "required": ["query"],
+    }
+
+    async def exec(self, query: str):
+        api_key = os.environ.get("TAVILY_API_KEY")
+        if not api_key:
+            return "未配置搜索API Key"
+
+        tavily = TavilyClient(api_key=api_key)
+
+        try:
+            response = tavily.search(
+                query=query,
+                search_depth="basic",
+                include_answer=True
+            )
+
+            if response.get("answer"):
+                return response["answer"]
+
+            results = response.get("results", [])
+            if not results:
+                return "未找到相关信息"
+
+            formatted = [
+                f"{item['title']}: {item['content']}"
+                for item in results[:5]
+            ]
+
+            return "\n".join(formatted)
+
+        except Exception as e:
+            return f"搜索失败：{str(e)}"
 
 
 class ToolCallParseError(Exception):
@@ -114,6 +210,7 @@ def parse_tool_call(text: str):
         text = text.strip()
         text = re.sub(r"^```json", "", text)
         text = re.sub(r"```$", "", text)
+        text = re.sub(r"^```", "", text)    
 
         # 2️⃣ 提取 JSON（防止模型前后说废话）
         match = re.search(r"\{.*\}", text, re.DOTALL)
@@ -212,29 +309,37 @@ class Agent:
                     logger.info(f"[TOOL RESULT] {result}")
 
                 messages.append({"role": "assistant", "content": response})
-                messages.append({"role": "assistant", "content": f"[TOOL RESULT]\n{result}"})
+                # 部分模型没有tool这个role，且不支持连续为assistant的角色
+                messages.append({"role": "user", "content": f"[TOOL RESULT]\n{result}"})
+                continue
 
             except Exception:
                 messages.append({"role": "assistant", "content": response})
+                logger.info(f"[Final RESULT] {response}")
                 return response
 
         return "Max steps exceeded"
 
     def _build_system_prompt(self):
-        tools = self.registry.list()
+        tools = self.registry._list()
 
         tools_str = "\n".join([
             # f"{t.name}: {t.description}\nparameters: {t.parameters}"
-            t.get_schema()
+            json.dumps(t.get_schema(), indent=4, ensure_ascii=False)
             for t in tools
         ])
-
-        return SYSTEM_PROMPT.format(tools=tools_str)
+        system_prompt = SYSTEM_PROMPT.replace("{{tools}}", tools_str)
+        logger.info(f"[SYSTEM] {system_prompt}")
+        return system_prompt
 
 async def main():
+    load_dotenv()
+    logger.info("已加载环境变量")
+
+    # Config
     modelconfig = ModelConfig(
         provider=os.getenv("MODEL_PROVIDER", "zai"),
-        model=os.getenv("MODEL", "GLM-4-Flash"),
+        model=os.getenv("MODEL", "GLM-4.5-Air"),
         api_key=os.getenv("API_KEY"),
         base_url=os.getenv("BASE_URL"),
         temperature=float(os.getenv("TEMPERATURE", 0.7)),
@@ -244,10 +349,25 @@ async def main():
         max_steps=int(os.getenv("MAX_STEPS", 10)),
         verbose=True
     )
+    logger.info(f"已加载模型配置")
+
+    # Tools
     add = Add()
-    schema = add.get_schema()
-    logger.info("启用的工具有：")
-    print(json.dumps(schema, indent=4, ensure_ascii=False))
+    weather = Weather()
+    search = TavilySearch()
+    tools = ToolRegistry()
+    tools.register(add)
+    tools.register(weather)
+    tools.register(search)
+    logger.info(f"启用的工具有：{[t.name for t in tools._list()]}")
+    print([t.name for t in tools._list()])
+    
+    # Agent
+    llm = LLMClient(modelconfig)
+    agent = Agent(llm, tools, agentConfig)  
+    logger.info("已创建Agent工作流")
+    prompt = "我想知道现在北京的天气适合到哪些景点游玩啊"
+    await agent.run(prompt)
 
 
 if __name__ == "__main__":

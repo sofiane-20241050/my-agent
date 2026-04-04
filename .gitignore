@@ -208,5 +208,8 @@ __marimo__/
 
 # dir
 log/
+logs/
 results/
+result/
+res/
 note.txt

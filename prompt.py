@@ -6,10 +6,11 @@ You can choose to either:
 2. Call a tool to help you answer
 
 Available tools:
-{tools}
+{{tools}}
 
 When you decide to call a tool, you MUST output in the following JSON format:
 
+```json
 {
   "tool": "<tool_name>",
   "args": {
@@ -17,6 +18,7 @@ When you decide to call a tool, you MUST output in the following JSON format:
     "<param2>": "<value2>"
   }
 }
+```
 
 Rules:
 - Do NOT include any extra text when calling a tool
